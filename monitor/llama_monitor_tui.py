@@ -87,6 +87,19 @@ LABELS = {
         "status_restarted": "再起動済み",
         "status_online":    "オンライン",
         "status_offline":   "オフライン",
+        "proxy":       "プロキシ",
+        "proxy_up":    "稼働中",
+        "proxy_down":  "停止中",
+        "compression": "圧縮量",
+        "corrections": "補正",
+        "saved":       "節約",
+        "requests":    "リクエスト",
+        "uptime":      "稼働",
+        "interventions":"介入",
+        "safeguard":   "安全装置",
+        "tool_fixes":  "Tool修復",
+        "fences":      "Fence修正",
+        "halluc":      "改行修復",
     },
     "en": {
         "title":       "StateForge LLM Monitor",
@@ -132,6 +145,19 @@ LABELS = {
         "status_restarted": "Restarted",
         "status_online":    "Online",
         "status_offline":   "Offline",
+        "proxy":       "Proxy",
+        "proxy_up":    "Active",
+        "proxy_down":  "Inactive",
+        "compression": "Compression",
+        "corrections": "Corrections",
+        "saved":       "Saved",
+        "requests":    "Requests",
+        "uptime":      "Uptime",
+        "interventions":"Interventions",
+        "safeguard":   "Safeguard",
+        "tool_fixes":  "Tool Fixes",
+        "fences":      "Fence Fixes",
+        "halluc":      "Newline Fixes",
     },
 }
 
@@ -312,7 +338,7 @@ class MonitorTUI:
 
         # --- エンジン ---
         # JSONデータからポートキーを動的に取得（非ポートキーを除外）
-        non_port_keys = {"system", "lang", "updated_at"}
+        non_port_keys = {"system", "lang", "updated_at", "proxy"}
         ports = sorted(k for k in self.data if k not in non_port_keys)
         for port in ports:
             engine = self.data.get(port)
@@ -324,6 +350,11 @@ class MonitorTUI:
             if status == "OFFLINE" or (status == "ONLINE" and (not pid or pid <= 0)):
                 continue
             row = self._draw_engine(stdscr, row, w, port, engine)
+
+        # --- プロキシメトリクス ---
+        proxy_data = self.data.get("proxy", {})
+        if proxy_data:
+            row = self._draw_proxy(stdscr, row, w, proxy_data)
 
         # --- フッター ---
         row += 1
@@ -493,6 +524,93 @@ class MonitorTUI:
             if row < h:
                 stdscr.addnstr(row, 0, f"  {warn_sym} {errors[0]}", w - 1, curses.color_pair(2))
                 row += 1
+
+        return row
+
+    def _draw_proxy(self, stdscr, row, w, proxy_data):
+        """プロキシのメトリクスパネルを描画する"""
+        L = self._l
+        h = stdscr.getmaxyx()[0]
+        row += 1
+
+        line_char = "-" if self.ascii_mode else "─"
+        header = f"{line_char * 2} {L('proxy')} "
+        header += line_char * max(0, w - display_width(header) - 1)
+        if row < h:
+            stdscr.addnstr(row, 0, header, w - 1, curses.color_pair(5) | curses.A_BOLD)
+        row += 1
+
+        for name, metrics in proxy_data.items():
+            if not isinstance(metrics, dict):
+                continue
+            if row >= h - 2:
+                break
+
+            port = metrics.get("port", "?")
+            total_req = metrics.get("total_requests", 0)
+            total_err = metrics.get("total_errors", 0)
+            active = metrics.get("active_requests", 0)
+            uptime_sec = metrics.get("uptime_seconds", 0)
+
+            if uptime_sec > 3600:
+                uptime_str = f"{uptime_sec / 3600:.1f}h"
+            elif uptime_sec > 60:
+                uptime_str = f"{uptime_sec / 60:.0f}m"
+            else:
+                uptime_str = f"{uptime_sec:.0f}s"
+
+            status_color = 1 if total_err == 0 else 3
+
+            sym = "*" if self.ascii_mode else "●"
+            segments = [
+                (f"{sym} {name} :{port}", 5),
+                (f"{L('proxy_up')}", status_color),
+                (f"{L('uptime')}:{uptime_str}", 0),
+                (f"{L('requests')}:{total_req}", 0),
+            ]
+            if total_err > 0:
+                segments.append((f"{L('errors')}:{total_err}", 2))
+            if active > 0:
+                segments.append((f"Active:{active}", 6))
+
+            row = self._draw_segments(stdscr, row, w, segments)
+
+            intervention_segments = []
+
+            tokens_saved = metrics.get("tokens_saved_by_compression", 0)
+            if tokens_saved > 0:
+                if tokens_saved >= 1000:
+                    saved_str = f"{tokens_saved / 1000:.1f}k"
+                else:
+                    saved_str = str(tokens_saved)
+                intervention_segments.append((f"  {L('compression')}:{saved_str} tokens {L('saved')}", 5))
+
+            comp_count = metrics.get("compression_invocations", 0)
+            if comp_count > 0:
+                intervention_segments.append((f"({comp_count}x)", 8))
+
+            tool_fixes = metrics.get("tool_call_fixes", 0)
+            if tool_fixes > 0:
+                intervention_segments.append((f"{L('tool_fixes')}:{tool_fixes}", 5))
+
+            safeguards = metrics.get("safeguard_activations", 0)
+            if safeguards > 0:
+                intervention_segments.append((f"{L('safeguard')}:{safeguards}", 2))
+
+            corrections = metrics.get("payload_corrections", 0)
+            if corrections > 0:
+                intervention_segments.append((f"  {L('corrections')}:{corrections}", 5))
+
+            fences = metrics.get("fence_standardizations", 0)
+            if fences > 0:
+                intervention_segments.append((f"{L('fences')}:{fences}", 5))
+
+            halluc = metrics.get("hallucination_fixes", 0)
+            if halluc > 0:
+                intervention_segments.append((f"{L('halluc')}:{halluc}", 5))
+
+            if intervention_segments:
+                row = self._draw_segments(stdscr, row, w, intervention_segments)
 
         return row
 
