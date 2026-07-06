@@ -373,6 +373,84 @@ EOFTEST
             echo ".aider.conf.yml already exists. Skipping."
         fi
         ;;
+    rust|rs)
+        if [ ! -f Cargo.toml ]; then
+            # Cargo.tomlがなければ初期化
+            cargo init
+            echo "Initialized Rust project with cargo init."
+        fi
+
+        if [ ! -f .aider/lint.sh ]; then
+            cat << 'EOF_LINT' > .aider/lint.sh
+#!/usr/bin/env bash
+
+# 先に自動フォーマットと安全な自動修正を試みる
+cargo fmt > /dev/null 2>&1
+cargo clippy --fix --allow-dirty --allow-no-vcs > /dev/null 2>&1
+
+# global lint を実行
+TMP_OUT=$(mktemp)
+cargo clippy --message-format=short > "$TMP_OUT" 2>&1
+LINT_EXIT_CODE=$?
+
+# 重大なコンパイルエラーがある場合は抽出してLLMに提示
+if grep -q "could not compile" "$TMP_OUT"; then
+    echo "🚨 ERROR: Global compilation failed during linting."
+    echo "Aider / LLM Notice: DO NOT guess fixes blindly. The true cause is likely a syntax/compile error."
+    grep -E "(error|could not compile)" "$TMP_OUT"
+    rm -f "$TMP_OUT"
+    exit 1
+fi
+
+if [ $LINT_EXIT_CODE -ne 0 ]; then
+    cat "$TMP_OUT"
+    rm -f "$TMP_OUT"
+    exit 1
+fi
+
+rm -f "$TMP_OUT"
+exit 0
+EOF_LINT
+            chmod +x .aider/lint.sh
+            echo "Created smart lint.sh wrapper for Rust."
+        fi
+
+        if [ ! -f .aider/test.sh ]; then
+            cat << 'EOFTEST' > .aider/test.sh
+#!/usr/bin/env bash
+
+# 1. 事前ビルドチェック（コンパイルエラーを表面化させる）
+cargo check --tests
+BUILD_STATUS=$?
+if [ $BUILD_STATUS -ne 0 ]; then
+    echo "=================================================="
+    echo "🚨 ERROR: Project compilation failed."
+    echo "Aider / LLM Notice: DO NOT hallucinate test fixes. The true cause is a syntax/compile error."
+    echo "Read the compiler output carefully before modifying anything."
+    echo "=================================================="
+    exit $BUILD_STATUS
+fi
+
+# 2. テスト実行
+cargo test
+TEST_STATUS=$?
+if [ $TEST_STATUS -ne 0 ]; then exit $TEST_STATUS; fi
+exit 0
+EOFTEST
+            chmod +x .aider/test.sh
+            echo "Created test.sh wrapper for Rust."
+        fi
+
+        if [ ! -f .aider.conf.yml ]; then
+            echo "test-cmd: ./.aider/test.sh" > .aider.conf.yml
+            echo "auto-test: true" >> .aider.conf.yml
+            echo "lint-cmd: ./.aider/lint.sh" >> .aider.conf.yml
+            echo "auto-lint: true" >> .aider.conf.yml
+            echo "Created .aider.conf.yml with cargo test and clippy settings."
+        else
+            echo ".aider.conf.yml already exists. Skipping."
+        fi
+        ;;
     *)
         echo "Warning: Unrecognized language '$LANG'. Creating generic Aider config."
         if [ ! -f .aider.conf.yml ]; then
