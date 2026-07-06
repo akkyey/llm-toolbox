@@ -284,10 +284,21 @@ go fmt ./... > /dev/null 2>&1
 TMP_OUT=$(mktemp)
 ~/go/bin/golangci-lint run > "$TMP_OUT" 2>&1
 
+# 重大なコンパイルエラー（typecheckやimportエラー）がある場合は、フィルタリングせずに全出力する
+if grep -qE "typecheck|could not import|build failed" "$TMP_OUT"; then
+    echo "🚨 ERROR: Global compilation failed during linting."
+    echo "Aider / LLM Notice: DO NOT guess fixes blindly. The true cause is likely a syntax/compile error."
+    grep -E "(typecheck|could not import|build failed)" "$TMP_OUT"
+    rm -f "$TMP_OUT"
+    exit 1
+fi
+
 # Filter output to ONLY show actual errors (file:line:col:) for the requested files
 HAS_RELEVANT_ERROR=0
 for file in "${GO_FILES[@]}"; do
     if grep -E "^(\./)?$file:[0-9]+:[0-9]+:" "$TMP_OUT"; then
+        # ★エラー行を標準出力に出す（Aiderに読ませるため）
+        grep -E "^(\./)?$file:[0-9]+:[0-9]+:" "$TMP_OUT"
         HAS_RELEVANT_ERROR=1
     fi
 done
