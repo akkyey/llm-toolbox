@@ -1,0 +1,14 @@
+[Unit]
+Description=StateForge LLM Monitor Daemon v2.0
+After=llama-server.service llama-server-coder.service
+
+[Service]
+Type=simple
+User=irom
+EnvironmentFile=-/home/irom/dev/llm-toolbox/monitor/monitor.env
+ExecStart=/usr/bin/python3 /home/irom/dev/llm-toolbox/monitor/llama_monitor_daemon.py --lang 
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
