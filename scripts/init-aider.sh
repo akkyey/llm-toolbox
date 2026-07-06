@@ -304,7 +304,7 @@ EOF_LINT
             echo "Created smart lint.sh wrapper for Go."
         fi
 
-        if [ ! -f test.sh ]; then
+        if [ ! -f .aider/test.sh ]; then
             cat << 'EOFTEST' > .aider/test.sh
 #!/usr/bin/env bash
 
@@ -313,6 +313,20 @@ if ! find . -name "*.go" -print -quit | grep -q .; then
     exit 0
 fi
 
+# 1. 全パッケージの事前ビルドチェック（深部のコンパイルエラーを表面化させる）
+go test -run=^$ ./...
+BUILD_STATUS=$?
+if [ $BUILD_STATUS -ne 0 ]; then
+    echo "=================================================="
+    echo "🚨 ERROR: Package compilation failed."
+    echo "Aider / LLM Notice: If you see a 'could not import' error, DO NOT change the import paths blindly."
+    echo "The true cause is likely a syntax/compile error INSIDE the imported package."
+    echo "Run 'go test ./path/to/failing_package' directly to reveal the hidden compilation error."
+    echo "=================================================="
+    exit $BUILD_STATUS
+fi
+
+# 2. カバレッジ付きでテスト実行
 go test -v -coverprofile=coverage.out ./...
 TEST_STATUS=$?
 if [ $TEST_STATUS -ne 0 ]; then exit $TEST_STATUS; fi
@@ -329,7 +343,7 @@ fi
 exit 0
 EOFTEST
             chmod +x .aider/test.sh
-            echo "Created test.sh wrapper with 80% coverage check."
+            echo "Created test.sh wrapper with 80% coverage check and build pre-check."
         fi
 
         if [ ! -f .aider.conf.yml ]; then
@@ -382,6 +396,13 @@ cat << 'EOF' > .aider/CONVENTIONS.md
 ## 依存ライブラリの追加について（Go言語など）
 go.mod などの依存関係ファイルを手動で編集して、ライブラリのバージョン番号を推測・直書きすることは絶対に避けてください。（存在しないバージョンを指定してしまい、ビルド不能になるのを防ぐためです）
 新しいライブラリを追加する際は、必ずターミナルコマンド（例: `go get github.com/...@latest`）を実行して、ツールキット側に正しい最新バージョンを解決させてください。
+
+## 依存パッケージのインポート・ビルドエラー時の対応方針（ハルシネーション防止）
+テスト実行時に `could not import myapp/...` やモジュールのビルドエラーに遭遇した場合、エラーが発生したテストファイル（例: `integration_test.go`）のインポートパスやパッケージ名を無闇に書き換えないでください。
+エラーの真の原因は「インポートされた側（依存パッケージ）の内部での構文エラーや未定義エラー」である可能性が高いです（標準のテストログではこの本当の原因が省略されがちです）。
+この場合、ハルシネーションを起こす前に、以下の手順を踏んで「本当の原因」を特定してください：
+1. エラーメッセージで指摘されている依存パッケージ単体を対象にテストまたはビルドを実行する（例: Goなら `go test ./internal/model`）。
+2. そこで出力された「本当のエラーログ」を確認し、原因となっているパッケージ内部のソースコードを読み込んで根本原因を修正する。
 
 ## カバレッジ向上と main() 関数のリファクタリング
 テストカバレッジが目標値に届かない場合、無闇にテストケースを自己増殖させないでください。特に `main()` 関数はテストフレームワークから直接呼び出しにくいため、カバレッジ低下の原因になりがちです。
