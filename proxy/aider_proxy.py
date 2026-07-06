@@ -11,6 +11,7 @@ from typing import Dict, Any, Optional
 
 # 共通モジュールのインポート
 import proxy_common
+from proxy_metrics import ProxyMetricsCollector
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
 logger = logging.getLogger("aider_proxy")
@@ -20,6 +21,9 @@ LLAMA_SERVER_URL = os.environ.get("LLAMA_SERVER_URL", "http://127.0.0.1:9090")
 PORT = int(os.environ.get("AIDER_PROXY_PORT", 9092))
 LOG_DIR = os.environ.get("AIDER_PROXY_LOG_DIR", "/home/irom/dev/ollama/aider_logs")
 HEARTBEAT_INTERVAL_SEC = int(os.environ.get("HEARTBEAT_INTERVAL_SEC", 60))
+
+# --- メトリクス収集器 ---
+aider_metrics = ProxyMetricsCollector("aider_proxy", PORT)
 
 @app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
 def proxy(path):
@@ -98,7 +102,10 @@ def proxy(path):
                             expected_fence = proxy_common.detect_expected_fence(data)
 
                             # レスポンス内のフェンスをAiderの期待するフェンスに統一
+                            original_content = content
                             content = proxy_common.standardize_fences(content, expected_fence)
+                            if content != original_content:
+                                aider_metrics.record_fence_standardization()
 
                             # --- Aiderのハルシネーション（改行漏れ）を自動修復 ---
                             # <<<<<<< SEARCH などの直後にコードが続いている場合、強制的に改行を挿入する
@@ -106,6 +113,8 @@ def proxy(path):
                             content = re.sub(r'(=======)[ \t]+([^\n]+)', r'\1\n\2', content)
                             content = re.sub(r'(>>>>>>> REPLACE)[ \t]+([^\n]+)', r'\1\n\2', content)
                             # --------------------------------------------------
+                            if content != original_content:
+                                aider_metrics.record_hallucination_fix()
 
                             # ログ保存
                             proxy_common.save_aider_log(data, msg.get('content', '') or '', content)
@@ -114,6 +123,7 @@ def proxy(path):
                             yield from proxy_common.send_dummy_chunks(content, res, finish_reason, tool_calls)
 
                         yield "data: [DONE]\n\n"
+                        aider_metrics.record_request_complete()
                         logger.info(f"[SUCCESS] 処理完了 (所要時間: {time.time() - start_time:.1f}秒)")
                         break
 

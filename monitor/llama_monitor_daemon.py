@@ -32,6 +32,7 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 OUTPUT_STATUS_JSON = Path("/home/irom/.local/state/stateforge/llama_status.json")
+PROXY_METRICS_JSON = Path("/home/irom/.local/state/stateforge/proxy_metrics.json")
 
 METRICS_INTERVAL_SEC = 5  # システムメトリクス収集間隔
 
@@ -737,6 +738,18 @@ class StatusWriter:
                 data["system"] = sys_dict
 
             data["lang"] = self._i18n.lang
+
+            # --- Proxy Metrics の読み取り（Graceful Degradation） ---
+            # プロキシが動いていない場合やファイルが存在しない場合は
+            # エラーにせず、単にスキップする（モニター単体での利用を妨げない）
+            try:
+                if PROXY_METRICS_JSON.exists():
+                    with open(PROXY_METRICS_JSON, "r", encoding="utf-8") as pf:
+                        proxy_data = json.load(pf)
+                    data["proxy"] = proxy_data.get("proxies", {})
+            except (json.JSONDecodeError, IOError, OSError):
+                pass  # Graceful Degradation: プロキシ情報は取得できなくても問題なし
+
             data["updated_at"] = datetime.now(JST).isoformat(timespec="seconds")
 
             tmp_path = self._output_path.with_suffix(".json.tmp")

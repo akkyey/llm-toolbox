@@ -16,6 +16,7 @@ import requests
 from headroom import compress
 
 import proxy_common
+from proxy_metrics import ProxyMetricsCollector
 
 LLAMA_SERVER_URL = os.environ.get("LLAMA_SERVER_URL", "http://127.0.0.1:9090")
 
@@ -245,6 +246,9 @@ def remove_unanchored_patterns(obj):
             remove_unanchored_patterns(item)
 
 
+# --- メトリクス収集器 ---
+kilo_metrics = ProxyMetricsCollector("kilo_proxy", 9091)
+
 # --- キャッシュ分析用グローバル状態とヘルパー関数 ---
 LAST_REQUEST_TEXT = ""
 LAST_SYSTEM_PROMPT = ""
@@ -367,6 +371,7 @@ def check_safeguard(data: Dict[str, Any], current_sys_msg: str,
         return None
 
     logger.warning("[SAFEGUARD] 巨大なキャッシュ崩壊を検知。リクエストを遮断し、クライアントに警告を返します。")
+    kilo_metrics.record_safeguard()
     if data.get('stream', False):
         def safeguard_generate():
             chunk = {
@@ -472,6 +477,7 @@ def preprocess_request(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     if original_len > 0:
         reduction = 100 - (compressed_len / original_len * 100)
         logger.info(f"[HEADROOM] 圧縮完了: {original_len}文字 -> {compressed_len}文字 (圧縮率: {reduction:.1f}%削減)")
+        kilo_metrics.record_compression(original_len, compressed_len)
     else:
         logger.info("[HEADROOM] メッセージが空のためスキップしました。")
 
@@ -661,6 +667,7 @@ def proxy(path: str) -> Response:
             )
 
         dump_payload(data)
+        kilo_metrics.record_request()
 
         # メッセージの前処理（キャッシュ分析の前に動的文字列をマスクする）
         preprocess_request(data)
