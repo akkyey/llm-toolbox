@@ -5,7 +5,7 @@ Proxy Metrics Collector
 プロキシの「有効性」を計測し、JSONファイルに書き出すモジュール。
 Monitor（Daemon/TUI）がこのJSONを読み取ってダッシュボードに表示する。
 
-出力先: /home/irom/.local/state/stateforge/proxy_metrics.json
+出力先: ~/.local/state/stateforge/proxy_metrics.json (PROXY_METRICS_JSON で上書き可能)
 """
 
 import json
@@ -19,9 +19,9 @@ from pathlib import Path
 JST = timezone(timedelta(hours=9))
 
 # Monitor Daemon と同じ状態ディレクトリに出力（読み取り側の実装を簡素化）
+_DEFAULT_METRICS_PATH = str(Path.home() / ".local" / "state" / "stateforge" / "proxy_metrics.json")
 OUTPUT_METRICS_JSON = Path(
-    os.getenv("PROXY_METRICS_JSON",
-              "/home/irom/.local/state/stateforge/proxy_metrics.json")
+    os.getenv("PROXY_METRICS_JSON", _DEFAULT_METRICS_PATH)
 )
 
 
@@ -142,29 +142,36 @@ class ProxyMetricsCollector:
 
         try:
             OUTPUT_METRICS_JSON.parent.mkdir(parents=True, exist_ok=True)
-
-            # 既存のJSONを読み込み、自分のプロキシのエントリだけを更新する
-            existing = {}
-            if OUTPUT_METRICS_JSON.exists():
+            
+            import fcntl
+            lock_path = OUTPUT_METRICS_JSON.with_suffix(".lock")
+            with open(lock_path, "w") as lock_f:
+                fcntl.flock(lock_f, fcntl.LOCK_EX)
                 try:
-                    with open(OUTPUT_METRICS_JSON, "r", encoding="utf-8") as f:
-                        existing = json.load(f)
-                except (json.JSONDecodeError, IOError):
+                    # 既存のJSONを読み込み、自分のプロキシのエントリだけを更新する
                     existing = {}
+                    if OUTPUT_METRICS_JSON.exists():
+                        try:
+                            with open(OUTPUT_METRICS_JSON, "r", encoding="utf-8") as f:
+                                existing = json.load(f)
+                        except (json.JSONDecodeError, IOError):
+                            existing = {}
 
-            # プロキシ名をキーとして自分のメトリクスを書き込む
-            if "proxies" not in existing:
-                existing["proxies"] = {}
-            existing["proxies"][self._metrics.name] = snapshot
-            existing["updated_at"] = datetime.now(JST).isoformat(timespec="seconds")
+                    # プロキシ名をキーとして自分のメトリクスを書き込む
+                    if "proxies" not in existing:
+                        existing["proxies"] = {}
+                    existing["proxies"][self._metrics.name] = snapshot
+                    existing["updated_at"] = datetime.now(JST).isoformat(timespec="seconds")
 
-            # アトミック書き込み
-            tmp_path = OUTPUT_METRICS_JSON.with_suffix(".json.tmp")
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(existing, f, indent=2, ensure_ascii=False)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(str(tmp_path), str(OUTPUT_METRICS_JSON))
+                    # アトミック書き込み（tmpファイル名は競合回避のため一意にする）
+                    tmp_path = OUTPUT_METRICS_JSON.with_suffix(f".{self._metrics.name}.json.tmp")
+                    with open(tmp_path, "w", encoding="utf-8") as f:
+                        json.dump(existing, f, indent=2, ensure_ascii=False)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(str(tmp_path), str(OUTPUT_METRICS_JSON))
+                finally:
+                    fcntl.flock(lock_f, fcntl.LOCK_UN)
 
         except Exception as e:
             import logging

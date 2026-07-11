@@ -15,6 +15,7 @@ Usage:
 import argparse
 import curses
 import json
+import os
 import sys
 import unicodedata
 import time
@@ -24,7 +25,10 @@ from pathlib import Path
 # 定数
 # ---------------------------------------------------------------------------
 
-DEFAULT_JSON_PATH = Path("/home/irom/.local/state/stateforge/llama_status.json")
+DEFAULT_JSON_PATH = Path(
+    os.environ.get("STATEFORGE_STATUS_JSON",
+                   str(Path.home() / ".local" / "state" / "stateforge" / "llama_status.json"))
+)
 DEFAULT_INTERVAL = 2  # 秒
 
 # ステータス → 表示用記号・色ID マッピング

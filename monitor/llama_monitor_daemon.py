@@ -31,8 +31,9 @@ from typing import Optional
 # 定数
 # ---------------------------------------------------------------------------
 
-OUTPUT_STATUS_JSON = Path("/home/irom/.local/state/stateforge/llama_status.json")
-PROXY_METRICS_JSON = Path("/home/irom/.local/state/stateforge/proxy_metrics.json")
+_STATEFORGE_DIR = Path.home() / ".local" / "state" / "stateforge"
+OUTPUT_STATUS_JSON = Path(os.environ.get("STATEFORGE_STATUS_JSON", str(_STATEFORGE_DIR / "llama_status.json")))
+PROXY_METRICS_JSON = Path(os.environ.get("PROXY_METRICS_JSON", str(_STATEFORGE_DIR / "proxy_metrics.json")))
 
 METRICS_INTERVAL_SEC = 5  # システムメトリクス収集間隔
 
@@ -42,6 +43,7 @@ JST = timezone(timedelta(hours=9))
 ENGINE_DEFS = {
     "9090": {"service": "llama-server",       "name_ja": "Local LLM (Port 9090)", "name_en": "Local LLM (Port 9090)"},
     "9091": {"service": "llama-server-coder", "name_ja": "Local LLM (Port 9091)", "name_en": "Local LLM (Port 9091)"},
+    "9093": {"service": "llama-server-architect", "name_ja": "Local LLM (Architect 9093)", "name_en": "Local LLM (Architect 9093)"},
 }
 
 # AMDGPU sysfs パス (動的解決へ移行)
@@ -848,6 +850,8 @@ class MonitorDaemon:
                 self._engine_defs[port] = {"service": "llama-server", "name_ja": "Local LLM (Port 9090)", "name_en": "Local LLM (Port 9090)"}
             elif port == "9091":
                 self._engine_defs[port] = {"service": "llama-server-coder", "name_ja": "Local LLM (Port 9091)", "name_en": "Local LLM (Port 9091)"}
+            elif port == "9093":
+                self._engine_defs[port] = {"service": "llama-server-architect", "name_ja": "Local LLM (Port 9093)", "name_en": "Local LLM (Port 9093)"}
             else:
                 self._engine_defs[port] = {"service": f"llama-server@{port}", "name_ja": f"Local LLM (Port {port})", "name_en": f"Local LLM (Port {port})"}
 
@@ -959,8 +963,8 @@ def main():
         help="表示言語 / Display language (default: ja)"
     )
     parser.add_argument(
-        "--ports", type=str, default="9090,9091",
-        help="監視対象ポート (カンマ区切り) / Ports to monitor (comma separated) (default: 9090,9091)"
+        "--ports", type=str, default="9090,9091,9093",
+        help="監視対象ポート (カンマ区切り) / Ports to monitor (comma separated) (default: 9090,9091,9093)"
     )
     args = parser.parse_args()
 

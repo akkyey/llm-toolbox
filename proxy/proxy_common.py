@@ -1,3 +1,4 @@
+import glob
 #!/usr/bin/env python3
 """
 Aider Proxy 用の共通モジュール
@@ -104,7 +105,7 @@ def standardize_fences(content: str, expected_fence: str) -> str:
         content = replaced_content
     return content
 
-def save_aider_log(data: Dict[str, Any], original_response: str, filtered_response: str) -> None:
+def save_aider_log(data: Dict[str, Any], original_response: str, filtered_response: str, log_dir: Optional[str] = None) -> None:
     """
     Aiderのログをファイルに保存
 
@@ -112,9 +113,10 @@ def save_aider_log(data: Dict[str, Any], original_response: str, filtered_respon
         data: リクエストデータ
         original_response: 元のレスポンス
         filtered_response: フィルタリング後のレスポンス
+        log_dir: ログ出力先ディレクトリ（省略時は環境変数 AIDER_PROXY_LOG_DIR を参照）
     """
-    # リクエストとレスポンスを aider_logs に保存
-    log_dir = "/home/irom/dev/ollama/aider_logs"
+    if log_dir is None:
+        log_dir = os.environ.get("AIDER_PROXY_LOG_DIR", os.path.join(os.getcwd(), "aider_logs"))
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f"chat_log_{int(time.time())}.json")
     try:
@@ -128,6 +130,21 @@ def save_aider_log(data: Dict[str, Any], original_response: str, filtered_respon
         logger.info(f"[LOG DUMP] Saved to {log_file}")
     except Exception as le:
         logger.error(f"[LOG DUMP ERROR] {le}")
+
+    # 古いログのクリーンアップ処理
+    try:
+        retention_days = int(os.environ.get("AIDER_PROXY_LOG_RETENTION_DAYS", 30))
+        if retention_days > 0:
+            current_time = time.time()
+            retention_seconds = retention_days * 24 * 60 * 60
+            for filepath in glob.glob(os.path.join(log_dir, "*.json")):
+                if os.path.isfile(filepath):
+                    file_mtime = os.path.getmtime(filepath)
+                    if (current_time - file_mtime) > retention_seconds:
+                        os.remove(filepath)
+                        logger.debug(f"[LOG CLEANUP] Removed old log: {filepath}")
+    except Exception as e:
+        logger.error(f"[LOG CLEANUP ERROR] {e}")
 
 def passthrough_proxy(request: Any, url: str) -> Any:
     """

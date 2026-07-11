@@ -19,7 +19,7 @@ logger = logging.getLogger("aider_proxy")
 app = Flask(__name__)
 LLAMA_SERVER_URL = os.environ.get("LLAMA_SERVER_URL", "http://127.0.0.1:9090")
 PORT = int(os.environ.get("AIDER_PROXY_PORT", 9092))
-LOG_DIR = os.environ.get("AIDER_PROXY_LOG_DIR", "/home/irom/dev/ollama/aider_logs")
+LOG_DIR = os.environ.get("AIDER_PROXY_LOG_DIR", os.path.join(os.getcwd(), "aider_logs"))
 HEARTBEAT_INTERVAL_SEC = int(os.environ.get("HEARTBEAT_INTERVAL_SEC", 60))
 
 # --- メトリクス収集器 ---
@@ -36,13 +36,62 @@ def proxy(path):
         data = request.get_json(silent=True) or {}
         is_stream = data.get('stream', False)
 
+        # モデル名による動的ルーティング (デュアルモデル対応)
+        model_name = data.get('model', '').lower()
+        logger.info(f"[DEBUG] Received model_name='{model_name}'")
+        architect_url_env = os.environ.get("LLAMA_ARCHITECT_URL", "http://127.0.0.1:9093")
+        if architect_url_env and ('gemma' in model_name or 'architect' in model_name or 'sonnet' in model_name):
+            url = f"{architect_url_env}/{clean_path}"
+            logger.info(f"[ROUTING] Route architect request to: {url}")
+        else:
+            logger.info(f"[ROUTING] Route editor request to DEFAULT: {url} (model={model_name})")
+
         # Aiderのタイムアウトを防ぐため、バックエンド(llama-server)には非ストリーミング(stream=False)でリクエストし、
         # プロキシ側でダミーのHeartbeatを送りながらバックエンドの生成完了を待つ。
         data['stream'] = False
 
         headers = {k: v for k, v in request.headers.items() if k.lower() not in ['host', 'content-length']}
 
-        logger.info(f"[REQUEST] path={clean_path} stream={is_stream} prompt_len={len(str(data.get('messages', '')))}")
+        prompt_len = len(str(data.get('messages', '')))
+        logger.info(f"[REQUEST] path={clean_path} stream={is_stream} prompt_len={prompt_len}")
+
+        # コンテキスト長が12万文字（約3〜4万トークン）を超える場合は強制的に安全にスキップ
+        if prompt_len > 120000:
+            logger.warning(f"[REJECTED] Prompt length {prompt_len} exceeds safety limit of 120000. Skipping task.")
+            if is_stream:
+                def generate_reject():
+                    # 最初のチャンクでroleを宣言
+                    init_chunk = {
+                        "id": "chatcmpl-aider-proxy-reject",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]
+                    }
+                    yield f"data: {json.dumps(init_chunk, ensure_ascii=False)}\n\n"
+                    # 次のチャンクでコンテンツを送信して終了
+                    msg_chunk = {
+                        "id": "chatcmpl-aider-proxy-reject",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "choices": [{"index": 0, "delta": {"content": "This task was automatically skipped by StateForge Proxy because the context window limit was exceeded.\n"}, "finish_reason": "stop"}]
+                    }
+                    yield f"data: {json.dumps(msg_chunk, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                return Response(generate_reject(), mimetype='text/event-stream')
+            else:
+                return Response(json.dumps({
+                    "id": "chatcmpl-aider-proxy-reject",
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "This task was automatically skipped by StateForge Proxy because the context window limit was exceeded."
+                        },
+                        "finish_reason": "stop"
+                    }]
+                }), status=200, mimetype='application/json')
 
         if is_stream:
             def generate():
@@ -109,15 +158,16 @@ def proxy(path):
 
                             # --- Aiderのハルシネーション（改行漏れ）を自動修復 ---
                             # <<<<<<< SEARCH などの直後にコードが続いている場合、強制的に改行を挿入する
+                            content_before_hallucination_fix = content
                             content = re.sub(r'(<<<<<<< SEARCH)[ \t]+([^\n]+)', r'\1\n\2', content)
                             content = re.sub(r'(=======)[ \t]+([^\n]+)', r'\1\n\2', content)
                             content = re.sub(r'(>>>>>>> REPLACE)[ \t]+([^\n]+)', r'\1\n\2', content)
                             # --------------------------------------------------
-                            if content != original_content:
+                            if content != content_before_hallucination_fix:
                                 aider_metrics.record_hallucination_fix()
 
                             # ログ保存
-                            proxy_common.save_aider_log(data, msg.get('content', '') or '', content)
+                            proxy_common.save_aider_log(data, msg.get('content', '') or '', content, log_dir=LOG_DIR)
 
                             # 擬似ストリーミング
                             yield from proxy_common.send_dummy_chunks(content, res, finish_reason, tool_calls)
@@ -147,6 +197,34 @@ def proxy(path):
             # 非ストリーミングモードの場合
             try:
                 resp = requests.post(url, json=data, headers=headers, timeout=3600)
+                resp.raise_for_status()
+                
+                resp_json = resp.json()
+                choices = resp_json.get('choices', [])
+                if choices:
+                    msg = choices[0].get('message', {})
+                    content = msg.get('content', '') or ''
+                    
+                    expected_fence = proxy_common.detect_expected_fence(data)
+                    original_content = content
+                    content = proxy_common.standardize_fences(content, expected_fence)
+                    if content != original_content:
+                        aider_metrics.record_fence_standardization()
+
+                    content_before_hallucination_fix = content
+                    content = re.sub(r'(<<<<<<< SEARCH)[ \t]+([^\n]+)', r'\1\n\2', content)
+                    content = re.sub(r'(=======)[ \t]+([^\n]+)', r'\1\n\2', content)
+                    content = re.sub(r'(>>>>>>> REPLACE)[ \t]+([^\n]+)', r'\1\n\2', content)
+                    if content != content_before_hallucination_fix:
+                        aider_metrics.record_hallucination_fix()
+
+                    proxy_common.save_aider_log(data, msg.get('content', '') or '', content, log_dir=LOG_DIR)
+                    
+                    choices[0]['message']['content'] = content
+                    resp_json['choices'] = choices
+                    
+                    return Response(json.dumps(resp_json, ensure_ascii=False), status=resp.status_code, mimetype='application/json')
+                
                 return Response(resp.content, status=resp.status_code, headers=dict(resp.headers))
             except Exception as e:
                 logger.error(f"[NON-STREAM ERROR] {e}")
