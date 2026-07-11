@@ -175,3 +175,143 @@ def passthrough_proxy(request: Any, url: str) -> Any:
     except Exception as e:
         logger.error(f"[PROXY ERROR] {e}")
         return Response(json.dumps({"error": str(e)}), status=500, mimetype='application/json')
+
+
+
+    test_result_marker = "I ran this command:\n\n./.aider/test.sh\n\nAnd got this output:"
+    
+    # 最新のテスト結果のインデックスを見つける
+    latest_test_idx = -1
+    for i in range(len(messages) - 1, -1, -1):
+        content = messages[i].get('content', '')
+        if isinstance(content, str) and test_result_marker in content:
+            latest_test_idx = i
+            break
+            
+    if latest_test_idx == -1:
+        return messages
+        
+    compressed_chars = 0
+    for i, msg in enumerate(messages):
+        content = msg.get('content', '')
+        if isinstance(content, str) and i < latest_test_idx and test_result_marker in content:
+            parts = content.split("And got this output:\n\n")
+            if len(parts) > 1:
+                original_len = len(content)
+                new_content = parts[0] + "And got this output:\n\n[... Previous test output truncated by StateForge Proxy to save context ...]"
+                msg['content'] = new_content
+                compressed_chars += (original_len - len(new_content))
+                
+    if compressed_chars > 0:
+        import logging
+        logger = logging.getLogger("aider_proxy")
+        logger.info(f"[FOCUS MODE] Truncated old test outputs. Saved {compressed_chars} characters.")
+        
+    return messages
+
+
+
+
+    test_result_marker = "I ran this command:" + chr(10) + chr(10) + "./.aider/test.sh" + chr(10) + chr(10) + "And got this output:"
+    repomap_marker = "Here is a summary of the repo:"
+    
+    # 最新のテスト結果のインデックスを見つける
+    latest_test_idx = -1
+    for i in range(len(messages) - 1, -1, -1):
+        content = messages[i].get('content', '')
+        if isinstance(content, str) and test_result_marker in content:
+            latest_test_idx = i
+            break
+            
+    compressed_chars = 0
+    for i, msg in enumerate(messages):
+        content = msg.get('content', '')
+        if not isinstance(content, str):
+            continue
+            
+        # 1. RepoMapの圧縮
+        if repomap_marker in content:
+            original_len = len(content)
+            # RepoMapマーカーだけ残して後続を削除
+            msg['content'] = repomap_marker + chr(10) + chr(10) + "[... RepoMap removed by StateForge Proxy to prevent context overflow and hallucination ...]"
+            compressed_chars += (original_len - len(msg['content']))
+            continue # RepoMapメッセージはテスト出力を含まないので次へ
+            
+        # 2. 古いテスト結果の圧縮
+        if i < latest_test_idx and test_result_marker in content:
+            parts = content.split("And got this output:" + chr(10) + chr(10))
+            if len(parts) > 1:
+                original_len = len(content)
+                new_content = parts[0] + "And got this output:" + chr(10) + chr(10) + "[... Previous test output truncated by StateForge Proxy to save context ...]"
+                msg['content'] = new_content
+                compressed_chars += (original_len - len(new_content))
+                
+    if compressed_chars > 0:
+        import logging
+        logger = logging.getLogger("aider_proxy")
+        logger.info(f"[FOCUS MODE] Truncated repomap/old test outputs. Saved {compressed_chars} characters.")
+        
+    return messages
+
+
+
+def compress_messages(messages: list) -> list:
+    """
+    過去のテスト実行結果や巨大なRepoMapを切り捨てることでコンテキストを圧縮する。
+    環境変数 AIDER_COMPRESS_TESTS と AIDER_COMPRESS_REPOMAP でオンオフを制御可能。
+    """
+    import os
+    
+    if not isinstance(messages, list):
+        return messages
+
+    # 環境変数の読み込み (デフォルトはオン=1)
+    compress_tests = str(os.environ.get('AIDER_COMPRESS_TESTS', '1')).lower() in ['1', 'true', 'yes', 'on']
+    compress_repomap = str(os.environ.get('AIDER_COMPRESS_REPOMAP', '1')).lower() in ['1', 'true', 'yes', 'on']
+
+    # どちらもオフなら何もしない
+    if not compress_tests and not compress_repomap:
+        return messages
+
+    test_result_marker = "I ran this command:\n\n./.aider/test.sh\n\nAnd got this output:"
+    repomap_marker = "Here is a summary of the repo:"
+    
+    # 最新のテスト結果のインデックスを見つける (テスト圧縮がオンの場合のみ)
+    latest_test_idx = -1
+    if compress_tests:
+        for i in range(len(messages) - 1, -1, -1):
+            content = messages[i].get('content', '')
+            if isinstance(content, str) and test_result_marker in content:
+                latest_test_idx = i
+                break
+            
+    compressed_chars = 0
+    for i, msg in enumerate(messages):
+        content = msg.get('content', '')
+        if not isinstance(content, str):
+            continue
+            
+        # 1. RepoMapの圧縮
+        if compress_repomap and repomap_marker in content:
+            original_len = len(content)
+            # RepoMapマーカーだけ残して後続を削除
+            msg['content'] = repomap_marker + "\n\n[... RepoMap removed by StateForge Proxy to prevent context overflow and hallucination ...]"
+            compressed_chars += (original_len - len(msg['content']))
+            continue # RepoMapメッセージはテスト出力を含まないので次へ
+            
+        # 2. 古いテスト結果の圧縮
+        if compress_tests and i < latest_test_idx and test_result_marker in content:
+            parts = content.split("And got this output:\n\n")
+            if len(parts) > 1:
+                original_len = len(content)
+                new_content = parts[0] + "And got this output:\n\n[... Previous test output truncated by StateForge Proxy to save context ...]"
+                msg['content'] = new_content
+                compressed_chars += (original_len - len(new_content))
+                
+    if compressed_chars > 0:
+        import logging
+        logger = logging.getLogger("aider_proxy")
+        logger.info(f"[FOCUS MODE] Truncated repomap/old test outputs. Saved {compressed_chars} characters.")
+        
+    return messages
+

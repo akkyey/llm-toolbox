@@ -52,12 +52,17 @@ def proxy(path):
 
         headers = {k: v for k, v in request.headers.items() if k.lower() not in ['host', 'content-length']}
 
+        # コンテキストの圧縮を実行
+        if 'messages' in data:
+            data['messages'] = proxy_common.compress_messages(data['messages'])
+
         prompt_len = len(str(data.get('messages', '')))
         logger.info(f"[REQUEST] path={clean_path} stream={is_stream} prompt_len={prompt_len}")
 
         # コンテキスト長が12万文字（約3〜4万トークン）を超える場合は強制的に安全にスキップ
-        if prompt_len > 120000:
-            logger.warning(f"[REJECTED] Prompt length {prompt_len} exceeds safety limit of 120000. Skipping task.")
+        max_context_chars = int(os.environ.get("AIDER_MAX_CONTEXT_CHARS", 120000))
+        if prompt_len > max_context_chars:
+            logger.warning(f"[REJECTED] Prompt length {prompt_len} exceeds safety limit of {max_context_chars}. Skipping task.")
             if is_stream:
                 def generate_reject():
                     # 最初のチャンクでroleを宣言
