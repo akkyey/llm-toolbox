@@ -1,9 +1,9 @@
-import glob
 #!/usr/bin/env python3
 """
 Aider Proxy 用の共通モジュール
 """
 
+import glob
 import time
 import json
 import logging
@@ -119,12 +119,51 @@ def save_aider_log(data: Dict[str, Any], original_response: str, filtered_respon
         log_dir = os.environ.get("AIDER_PROXY_LOG_DIR", os.path.join(os.getcwd(), "aider_logs"))
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f"chat_log_{int(time.time())}.json")
+    failure_reason = None
+    messages = data.get("messages", [])
+    if messages and isinstance(messages, list):
+        last_msg = messages[-1].get("content", "")
+        if isinstance(last_msg, str):
+            if "did not find a match for that SEARCH block" in last_msg:
+                failure_reason = "FORMAT_ERROR_SEARCH_MISMATCH"
+            elif "Bad/missing filename" in last_msg or "Invalid edit block" in last_msg:
+                failure_reason = "FORMAT_ERROR_FILENAME"
+            elif "You must use the" in last_msg and "block to output your edits" in last_msg:
+                failure_reason = "FORMAT_ERROR_FENCE"
+            elif "I am an AI" in original_response or "申し訳" in original_response:
+                failure_reason = "ROLE_CONFUSION_CHATBOT"
+            elif "Fail Fast:" in filtered_response:
+                if "exceeded_15000_tokens_limit" in filtered_response:
+                    failure_reason = "EXCEEDED_15000_TOKENS_LIMIT"
+                elif "repetition_loop" in filtered_response:
+                    failure_reason = "REPETITION_LOOP"
+                elif "chatbot_phrase" in filtered_response:
+                    failure_reason = "CHATBOT_PHRASE"
+                elif "SEARCH block" in last_msg:
+                    failure_reason = "FORMAT_ERROR_SEARCH_MISMATCH_FAILFAST"
+                elif "filename" in last_msg:
+                    failure_reason = "FORMAT_ERROR_FILENAME_FAILFAST"
+                else:
+                    failure_reason = "FAILFAST_OTHER"
+
+            # Check if the matched file was actually missing from the context
+            is_mismatch = failure_reason in ["FORMAT_ERROR_SEARCH_MISMATCH", "FORMAT_ERROR_SEARCH_MISMATCH_FAILFAST"]
+            is_potential_null_fail = failure_reason is None and "<<<<<<< SEARCH" in (original_response or "")
+            
+            if is_mismatch or is_potential_null_fail:
+                if _is_target_file_missing_from_context(original_response, messages):
+                    if failure_reason == "FORMAT_ERROR_SEARCH_MISMATCH_FAILFAST" or "Fail Fast:" in (filtered_response or ""):
+                        failure_reason = "CONTEXT_MISSING_FILE_FAILFAST"
+                    else:
+                        failure_reason = "CONTEXT_MISSING_FILE"
+
     try:
         with open(log_file, "w", encoding="utf-8") as f:
             json.dump({
                 "timestamp": time.time(),
+                "failure_reason": failure_reason,
                 "request": data,
-                "original_response": original_response or '',
+                "original_response": original_response or "",
                 "filtered_response": filtered_response
             }, f, ensure_ascii=False, indent=2)
         logger.info(f"[LOG DUMP] Saved to {log_file}")
@@ -314,4 +353,61 @@ def compress_messages(messages: list) -> list:
         logger.info(f"[FOCUS MODE] Truncated repomap/old test outputs. Saved {compressed_chars} characters.")
         
     return messages
+
+
+
+def _is_target_file_missing_from_context(original_response: str, messages: list) -> bool:
+    """
+    LLMが編集しようとしたファイル名が、messages(コンテキスト)に含まれているか確認する。
+    含まれていない場合は True (欠落している) を返す。
+    """
+    if not original_response:
+        return False
+
+    # 1. messages から送られたファイル(ソースコード)のリストを抽出する
+    shared_files = set()
+    pattern = re.compile(r'(?:^|\n)([a-zA-Z0-9_\-\.\/\\ ]+)\n```[a-zA-Z0-9_\-\+]*\n', re.DOTALL)
+    for msg in messages:
+        if msg.get('role') == 'user':
+            content = msg.get('content', '') or ''
+            for path in pattern.findall(content):
+                path = path.strip()
+                if '.' in path or '/' in path or '\\' in path or '\\' in path:
+                    shared_files.add(path)
+
+    # 2. LLMレスポンスから「編集しようとしたファイル」を抽出する
+    # SEARCHブロックを探す
+    search_blocks = re.findall(r'<<<<<<< SEARCH', original_response)
+    if not search_blocks:
+        return False
+
+    mentioned_files = []
+    lines = original_response.split('\n')
+    for idx, line in enumerate(lines):
+        if '<<<<<<< SEARCH' in line:
+            lookback = lines[max(0, idx-4):idx]
+            for lbl in reversed(lookback):
+                lbl_clean = lbl.strip()
+                if re.match(r'^[\w/._-]+\.\w+$', lbl_clean):
+                    mentioned_files.append(lbl_clean)
+                    break
+                m = re.search(r'`([\w/._-]+\.\w+)`', lbl_clean)
+                if m:
+                    mentioned_files.append(m.group(1))
+                    break
+
+    if not mentioned_files:
+        return False
+
+    # 3. 編集対象ファイルが、共有ファイルリストに含まれているか検証
+    for tf in mentioned_files:
+        has_match = False
+        for sf in shared_files:
+            if sf == tf or sf.endswith('/' + tf) or sf.endswith('\\' + tf):
+                has_match = True
+                break
+        if not has_match:
+            return True
+
+    return False
 
