@@ -5,6 +5,8 @@ __pycache__/
 *.log
 .env
 
+aider_logs/
 proxy/aider_logs/
 __pycache__/
 *.pyc
+
