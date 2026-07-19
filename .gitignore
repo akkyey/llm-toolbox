@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.log
+.env
+
+aider_logs/
+proxy/aider_logs/
+__pycache__/
+*.pyc
+
+# TODO list
+TODO.md

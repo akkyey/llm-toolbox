@@ -1,0 +1,606 @@
+import json
+import time
+import queue
+import difflib
+import threading
+import logging
+import re
+import os
+from flask import Flask, request, Response
+import requests
+from typing import Dict, Any, Optional
+
+# 共通モジュールのインポート
+import proxy_common
+from proxy_metrics import ProxyMetricsCollector
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
+logger = logging.getLogger("aider_proxy")
+
+app = Flask(__name__)
+LLAMA_SERVER_URL = os.environ.get("LLAMA_SERVER_URL", "http://127.0.0.1:9090")
+PORT = int(os.environ.get("AIDER_PROXY_PORT", 9092))
+LOG_DIR = os.environ.get("AIDER_PROXY_LOG_DIR", os.path.join(os.getcwd(), "aider_logs"))
+HEARTBEAT_INTERVAL_SEC = int(os.environ.get("HEARTBEAT_INTERVAL_SEC", 60))
+
+aider_metrics = ProxyMetricsCollector("aider_proxy", PORT)
+
+@app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
+def proxy(path):
+    clean_path = path.replace(' ', '')
+    url = f"{LLAMA_SERVER_URL}/{clean_path}"
+
+    if request.method == 'POST' and clean_path.endswith('chat/completions'):
+        data = request.get_json(silent=True) or {}
+        is_stream = data.get('stream', False)
+
+        model_name = data.get('model', '').lower()
+        logger.info(f"[DEBUG] Received model_name='{model_name}'")
+        architect_url_env = os.environ.get("LLAMA_ARCHITECT_URL", "http://127.0.0.1:9093")
+        editor_url_env = os.environ.get("LLAMA_SERVER_URL", "http://127.0.0.1:9090")
+        
+        is_editor = 'editor' in model_name
+        
+        if is_editor:
+            url = f"{editor_url_env}/{clean_path}"
+            logger.info(f"[ROUTING] Route editor request to: {url} (model={model_name})")
+        else:
+            url = f"{architect_url_env}/{clean_path}"
+            logger.info(f"[ROUTING] Route architect request to: {url} (model={model_name})")
+
+        headers = {k: v for k, v in request.headers.items() if k.lower() not in ['host', 'content-length']}
+
+        # コンテキストの圧縮を実行
+        if 'messages' in data:
+            data['messages'] = proxy_common.compress_messages(data['messages'])
+
+        prompt_len = len(str(data.get('messages', '')))
+        logger.info(f"[REQUEST] path={clean_path} stream={is_stream} prompt_len={prompt_len}")
+
+        # Clear llama-server slots at the start of a new session to prevent state pollution
+        messages = data.get('messages', [])
+
+
+        # ------------------------------------------------------------
+        # [B] Editor missing context file fail-fast (Universal)
+        # ------------------------------------------------------------
+        last_msg = str(messages[-1].get('content', '')) if messages else ''
+        if is_editor and messages:
+            # Extract target file name from the final user instruction
+            target_file_match = re.search(r'(?:edit|update|patch|file)\s+([a-zA-Z0-9_\-\.\/\\ ]+\.[a-zA-Z0-9_]+)', last_msg, re.IGNORECASE)
+            if target_file_match:
+                target_file = target_file_match.group(1).strip()
+                # Check if target file content is present in the preceding messages
+                files_dict = _extract_files_from_messages(messages[:-1])
+                # Check normalized key match to tolerate discrepancies
+                norm_target = target_file.replace('\\', '/').strip('/')
+                has_file_content = False
+                for f_path in files_dict.keys():
+                    if f_path.replace('\\', '/').strip('/') == norm_target:
+                        has_file_content = True
+                        break
+                
+                if not has_file_content:
+                    logger.warning(f"[FAIL FAST] Editor context missing file content for: {target_file}. Returning 400 Bad Request.")
+                    dummy_text = "Fail Fast: Retry skipped (Editor context missing target file content)."
+                    proxy_common.save_aider_log(data, "", dummy_text, log_dir=LOG_DIR)
+                    err_json = {
+                        "error": {
+                            "message": dummy_text,
+                            "type": "invalid_request_error",
+                            "code": "missing_context_file"
+                        }
+                    }
+                    return Response(json.dumps(err_json), status=400, mimetype='application/json')
+        if messages:
+            has_assistant = any(m.get('role') == 'assistant' for m in messages)
+            if not has_assistant:
+                try:
+                    # Slot 0 is default for single-slot servers (-np 1)
+                    r1 = requests.post("http://127.0.0.1:9090/slots/0?action=erase", timeout=3)
+                    r2 = requests.post("http://127.0.0.1:9093/slots/0?action=erase", timeout=3)
+                    logger.info(f"[CACHE CLEAR] Erased slots on 9090 (status: {r1.status_code}) and 9093 (status: {r2.status_code}) to prevent state pollution.")
+                except Exception as ce:
+                    logger.error(f"[CACHE CLEAR ERROR] Failed to clear slots: {ce}")
+
+        if str(os.environ.get("AIDER_FAIL_FAST", "1")).lower() in ["1", "true"]:
+            messages = data.get('messages', [])
+            if messages:
+                last_msg = str(messages[-1].get('content', ''))
+                retry_keywords = [
+                    "did not find a match for that SEARCH block",
+                    "The SEARCH block in your edit",
+                    "Invalid edit block",
+                    "No changes",
+                    "SEARCH/REPLACE block failed to match",
+                    "SearchReplaceNoExactMatch",
+                    "The SEARCH section must exactly match",
+                    "Fail Fast: Retry skipped",
+                ]
+                # Count how many errors have occurred in the current session history
+                error_count = sum(1 for m in messages if m.get('role') == 'user' and any(k in str(m.get('content', '')) for k in retry_keywords))
+                
+                # Only trigger Fail Fast on the SECOND or later retry request (allows 1 retry attempt)
+                if messages[-1].get('role') == 'user' and any(k in last_msg for k in retry_keywords) and error_count >= 2:
+                    logger.warning(f"[FAIL FAST] Aider retry requested (error count: {error_count}). Returning 400 Bad Request.")
+                    dummy_text = "Fail Fast: Retry skipped."
+                    proxy_common.save_aider_log(data, "", dummy_text, log_dir=LOG_DIR)
+                    err_json = {
+                        "error": {
+                            "message": dummy_text,
+                            "type": "invalid_request_error",
+                            "code": "retry_limit_exceeded"
+                        }
+                    }
+                    return Response(json.dumps(err_json), status=400, mimetype='application/json')
+
+        max_context_chars = int(os.environ.get("AIDER_MAX_CONTEXT_CHARS", 120000))
+        if prompt_len > max_context_chars:
+            logger.warning(f"[REJECTED] Prompt length exceeds safety limit. Returning 400 Bad Request.")
+            err_json = {
+                "error": {
+                    "message": "This task was automatically skipped by StateForge Proxy because the context window limit was exceeded.",
+                    "type": "invalid_request_error",
+                    "code": "context_limit_exceeded"
+                }
+            }
+            return Response(json.dumps(err_json), status=400, mimetype='application/json')
+
+        def fetch_stream_with_hallucination_detection():
+            data['stream'] = True
+            content_buffer = ""
+            hallucination_detected = False
+            hallucination_reason = ""
+            finish_reason = "stop"
+            tool_calls = None
+            token_count = 0
+            try:
+                resp = requests.post(url, json=data, headers=headers, timeout=3600, stream=True)
+                resp.raise_for_status()
+                for line in resp.iter_lines():
+                    if line:
+                        line_str = line.decode('utf-8')
+                        if line_str.startswith("data: "):
+                            json_str = line_str[6:]
+                            if json_str == "[DONE]":
+                                break
+                            try:
+                                chunk = json.loads(json_str)
+                                choices = chunk.get("choices", [{}])[0]
+                                delta = choices.get("delta", {})
+                                content = delta.get("content") or ""
+                                reasoning = delta.get("reasoning_content") or ""
+                                tc = delta.get("tool_calls")
+                                if tc: tool_calls = tc
+                                
+                                appended = content + reasoning
+                                if appended:
+                                    content_buffer += appended
+                                    token_count += len(appended.split())
+                                    
+                                    # --- [B] Chatbot phrase detection (first 500 chars) ---
+                                    if len(content_buffer) < 600 and len(content_buffer) > 50:
+                                        chatbot_phrases = [
+                                            "I don't have access to",
+                                            "I do not have access to",
+                                            "Please provide the file",
+                                            "please share the file",
+                                            "please add the file",
+                                            "I cannot directly",
+                                            "I'm not able to",
+                                            "I am not able to",
+                                            "I need you to provide",
+                                            "I'll just say",
+                                            "I will just say",
+                                            "Please provide the files",
+                                            "I can't access",
+                                            "I cannot access",
+                                        ]
+                                        lower_buf = content_buffer.lower()
+                                        for phrase in chatbot_phrases:
+                                            if phrase.lower() in lower_buf:
+                                                hallucination_detected = True
+                                                hallucination_reason = f"chatbot_phrase: {phrase}"
+                                                logger.warning(f"[HALLUCINATION] Chatbot phrase detected: '{phrase}'")
+                                                resp.close()
+                                                break
+                                        if hallucination_detected:
+                                            break
+                                            
+                                    # --- [B2] Architect interaction fail-fast (Benchmark mode only, first 500 chars) ---
+                                    is_benchmark_mode = str(os.environ.get("AIDER_BENCHMARK_MODE", "0")).lower() in ["1", "true"]
+                                    if is_benchmark_mode and not is_editor and len(content_buffer) < 600 and len(content_buffer) > 50:
+                                        interaction_triggers = [
+                                            "You haven't named any files",
+                                            "which 3-5 files from this repo",
+                                            "files from this repo should I look at"
+                                        ]
+                                        lower_buf = content_buffer.lower()
+                                        for trig in interaction_triggers:
+                                            if trig.lower() in lower_buf:
+                                                hallucination_detected = True
+                                                hallucination_reason = f"architect_interaction: {trig}"
+                                                logger.warning(f"[FAIL FAST] Architect requested user interaction loop: '{trig}'")
+                                                resp.close()
+                                                break
+                                        if hallucination_detected:
+                                            break
+                                    
+                                    # --- [A] Token budget guard ---
+                                    if is_editor and token_count > 1500:
+                                        if '<<<<<<< SEARCH' not in content_buffer:
+                                            hallucination_detected = True
+                                            hallucination_reason = f"editor_token_budget: {token_count} tokens without SEARCH marker"
+                                            logger.warning(f"[HALLUCINATION] Editor exceeded token budget ({token_count} tokens) without producing SEARCH marker.")
+                                            resp.close()
+                                            break
+                                    
+                                    # --- [A2] Architect token budget guard ---
+                                    if not is_editor and token_count > 15000:
+                                        hallucination_detected = True
+                                        hallucination_reason = f"architect_token_budget: {token_count} tokens exceeded hard cap"
+                                        logger.warning(f"[HALLUCINATION] Architect exceeded token budget ({token_count} tokens). Hard cap at 15000.")
+                                        resp.close()
+                                        break
+                                    
+                                    # Real-time hallucination detection (repetition)
+                                    if len(content_buffer) > 200:
+                                        tail = content_buffer[-5000:]
+                                        # Short patterns (word-level 2-20 chars): require 20+ consecutive repeats
+                                        # Long patterns (sentence-level 20-150 chars): require 8+ consecutive repeats
+                                        if (len(set(content_buffer[-100:])) < 4
+                                            or re.search(r'(.{2,20})\1{19,}', tail, re.DOTALL)
+                                            or re.search(r'(.{20,150})\1{7,}', tail, re.DOTALL)):
+                                            hallucination_detected = True
+                                            hallucination_reason = "repetition_loop"
+                                            logger.warning(f"[HALLUCINATION] Repetition loop detected.")
+                                            resp.close()
+                                            break
+                                        
+                                        # Non-consecutive sentence/line repetition detection
+                                        # Splits tail by sentence/newline boundaries and counts duplicates for segments > 25 chars
+                                        segments = [s.strip() for s in re.split(r'[.\n?!]+', tail) if len(s.strip()) > 25]
+                                        segment_counts = {}
+                                        for seg in segments:
+                                            segment_counts[seg] = segment_counts.get(seg, 0) + 1
+                                            if segment_counts[seg] >= 12:  # Same sentence repeated 12+ times in the tail
+                                                hallucination_detected = True
+                                                hallucination_reason = f"sentence_repetition_loop"
+                                                logger.warning(f"[HALLUCINATION] Sentence repeated {segment_counts[seg]} times: '{seg[:60]}...'")
+                                                resp.close()
+                                                break
+                                        if hallucination_detected:
+                                            break
+                            except Exception as e:
+                                pass
+                return content_buffer, hallucination_detected, hallucination_reason, finish_reason, tool_calls, None
+            except Exception as e:
+                return "", False, "", "stop", None, e
+
+        if is_stream:
+            def generate():
+                dummy = {"id": "chatcmpl-init", "object": "chat.completion.chunk", "created": int(time.time()), "model": "qwen", "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": None}]}
+                yield f'data: {json.dumps(dummy)}\n\n'
+
+                q = queue.Queue()
+                def worker():
+                    buf, hallucinated, h_reason, reason, tc, err = fetch_stream_with_hallucination_detection()
+                    if err:
+                        logger.error(f"[WORKER ERROR] {err}")
+                        err_msg = str(err)
+                        content = f"Fail Fast: Retry skipped (Backend inference error: {err_msg})."
+                        proxy_common.save_aider_log(data, "", content, log_dir=LOG_DIR)
+                        q.put({"choices": [{"message": {"content": content, "role": "assistant"}, "finish_reason": "stop"}]})
+                    elif hallucinated:
+                        proxy_common.save_aider_log(data, buf, f"Fail Fast: Retry skipped (Hallucination detected mid-stream: {h_reason}).\n\n--- Aborted buffer ({len(buf)} chars) ---\n{buf[-500:]}", log_dir=LOG_DIR)
+                        q.put(Exception(f"Hallucination detected mid-stream: {h_reason}"))
+                    else:
+                        q.put({"choices": [{"message": {"content": buf, "role": "assistant"}, "finish_reason": "stop", "tool_calls": tc}]})
+
+                threading.Thread(target=worker, daemon=True).start()
+
+                start_time = time.time()
+                last_heartbeat = time.time()
+
+                while True:
+                    try:
+                        res = q.get(timeout=1.0)
+                        if isinstance(res, Exception):
+                            err_chunk = {"id": "chatcmpl-err", "object": "chat.completion.chunk", "created": int(time.time()), "choices": [{"index": 0, "delta": {"content": f"\n[Aider Proxy Backend Error: {res}]\n"}, "finish_reason": "stop"}]}
+                            yield f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            break
+
+                        choices = res.get('choices', [])
+                        if choices:
+                            msg = choices[0].get('message', {})
+                            content = msg.get('content', '') or ''
+                            tool_calls = res.get('tool_calls')
+                            finish_reason = choices[0].get('finish_reason', 'stop')
+
+                            expected_fence = proxy_common.detect_expected_fence(data)
+                            original_content = content
+                            content = proxy_common.standardize_fences(content, expected_fence)
+                            if content != original_content:
+                                aider_metrics.record_fence_standardization()
+                                logger.info(f"[FORMAT FIX] Fence standardized (expected: {expected_fence})")
+
+                            content_before_hallucination_fix = content
+                            content = re.sub(r'(<<<<<<< SEARCH)[ \t]+([^\n]+)', r'\1\n\2', content)
+                            content = re.sub(r'(=======)[ \t]+([^\n]+)', r'\1\n\2', content)
+                            content = re.sub(r'(>>>>>>> REPLACE)[ \t]+([^\n]+)', r'\1\n\2', content)
+                            if content != content_before_hallucination_fix:
+                                aider_metrics.record_hallucination_fix()
+                                logger.info("[FORMAT FIX] Separated inline code from SEARCH/REPLACE marker")
+
+                            # --- [D] Filename completion ---
+                            content = _complete_missing_filenames(content, data)
+                            # --- [E] Indent correction ---
+                            content = _fix_search_indentation(content, data)
+
+                            proxy_common.save_aider_log(data, msg.get('content', '') or '', content, log_dir=LOG_DIR)
+                            yield from proxy_common.send_dummy_chunks(content, res, finish_reason, tool_calls)
+
+                        yield "data: [DONE]\n\n"
+                        aider_metrics.record_request_complete()
+                        logger.info(f"[SUCCESS] 処理完了 (所要時間: {time.time() - start_time:.1f}秒)")
+                        break
+
+                    except queue.Empty:
+                        elapsed = time.time() - start_time
+                        if time.time() - last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
+                            heartbeat = {"id": "chatcmpl-heartbeat", "object": "chat.completion.chunk", "created": int(time.time()), "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": None}]}
+                            yield f"data: {json.dumps(heartbeat)}\n\n"
+                            last_heartbeat = time.time()
+                            logger.info(f"[HEARTBEAT] 待機中... ({elapsed:.0f}秒経過)")
+
+            return Response(generate(), mimetype='text/event-stream')
+
+        else:
+            buf, hallucinated, h_reason, reason, tc, err = fetch_stream_with_hallucination_detection()
+            if err:
+                logger.error(f"[NON-STREAM ERROR] {err}")
+                err_msg = str(err)
+                content = f"Fail Fast: Retry skipped (Backend inference error: {err_msg})."
+                proxy_common.save_aider_log(data, "", content, log_dir=LOG_DIR)
+                resp_json = {
+                    "id": "chatcmpl-proxy-err",
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": data.get("model", "qwen"),
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": content
+                        },
+                        "finish_reason": "stop"
+                    }]
+                }
+                return Response(json.dumps(resp_json, ensure_ascii=False), status=200, mimetype='application/json')
+            
+            if hallucinated:
+                content = f"Fail Fast: Retry skipped (Hallucination detected mid-stream: {h_reason})."
+                proxy_common.save_aider_log(data, buf, f"{content}\n\n--- Aborted buffer ({len(buf)} chars) ---\n{buf[-500:]}", log_dir=LOG_DIR)
+                err_json = {
+                    "error": {
+                        "message": content,
+                        "type": "invalid_request_error",
+                        "code": "hallucination_detected"
+                    }
+                }
+                return Response(json.dumps(err_json), status=400, mimetype='application/json')
+            else:
+                content = buf
+                expected_fence = proxy_common.detect_expected_fence(data)
+                original_content_ns = content
+                content = proxy_common.standardize_fences(content, expected_fence)
+                if content != original_content_ns:
+                    logger.info(f"[FORMAT FIX] Fence standardized (expected: {expected_fence})")
+                content_before_hfix_ns = content
+                content = re.sub(r'(<<<<<<< SEARCH)[ \t]+([^\n]+)', r'\1\n\2', content)
+                content = re.sub(r'(=======)[ \t]+([^\n]+)', r'\1\n\2', content)
+                content = re.sub(r'(>>>>>>> REPLACE)[ \t]+([^\n]+)', r'\1\n\2', content)
+                if content != content_before_hfix_ns:
+                    logger.info("[FORMAT FIX] Separated inline code from SEARCH/REPLACE marker")
+                # --- [D] Filename completion ---
+                content = _complete_missing_filenames(content, data)
+                # --- [E] Indent correction ---
+                content = _fix_search_indentation(content, data)
+                proxy_common.save_aider_log(data, buf, content, log_dir=LOG_DIR)
+
+            resp_json = {
+                "id": "chatcmpl-proxy",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": data.get("model", "qwen"),
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": content
+                    },
+                    "finish_reason": reason
+                }]
+            }
+            if tc:
+                resp_json["choices"][0]["message"]["tool_calls"] = tc
+            
+            return Response(json.dumps(resp_json, ensure_ascii=False), status=200, mimetype='application/json')
+
+    return proxy_common.passthrough_proxy(request, url)
+
+
+# ============================================================
+# [D] Filename completion: infer missing filename for SEARCH/REPLACE blocks
+# ============================================================
+def _complete_missing_filenames(content: str, data: dict) -> str:
+    """If a SEARCH/REPLACE block is missing a filename, try to infer it."""
+    # Extract filenames shared by Aider from the messages
+    shared_files = set()
+    for m in data.get('messages', []):
+        text = str(m.get('content', ''))
+        # Aider says things like: "path/to/file.py\n```python"
+        # Look for file paths that precede code fences
+        for match in re.finditer(r'^([\w/._-]+\.\w+)\s*$', text, re.MULTILINE):
+            candidate = match.group(1)
+            if '/' in candidate or candidate.endswith('.py'):
+                shared_files.add(candidate)
+    
+    if not shared_files:
+        return content
+    
+    # Find SEARCH blocks without a preceding filename
+    # Pattern: a code fence immediately followed by SEARCH, without a filename line before it
+    lines = content.split('\n')
+    fixed_lines = []
+    i = 0
+    fixes_made = 0
+    while i < len(lines):
+        line = lines[i]
+        # Check if this line is a code fence opening (```python, ```py, etc.)
+        if re.match(r'^```\w*$', line.strip()):
+            # Check if next line is <<<<<<< SEARCH
+            if i + 1 < len(lines) and '<<<<<<< SEARCH' in lines[i + 1]:
+                # Check if previous line is NOT a filename (it should be)
+                prev_line = fixed_lines[-1].strip() if fixed_lines else ''
+                has_filename = bool(re.match(r'^[\w/._-]+\.\w+$', prev_line))
+                if not has_filename and len(shared_files) == 1:
+                    # Insert the single shared filename
+                    filename = list(shared_files)[0]
+                    fixed_lines.append(filename)
+                    fixes_made += 1
+                    logger.info(f"[FORMAT FIX] Inserted missing filename: {filename}")
+        fixed_lines.append(line)
+        i += 1
+    
+    if fixes_made > 0:
+        return '\n'.join(fixed_lines)
+    return content
+
+
+# ============================================================
+# [E] Indent correction: normalize SEARCH block indentation
+# ============================================================
+def _extract_files_from_messages(messages):
+    files = {}
+    pattern = re.compile(r'(?:^|\n)([a-zA-Z0-9_\-\.\/\\ ]+)\n```[a-zA-Z0-9_\-\+]*\n(.*?)\n```', re.DOTALL)
+    for msg in messages:
+        if msg.get('role') == 'user':
+            content = msg.get('content', '')
+            matches = pattern.findall(content)
+            for path, file_content in matches:
+                path = path.strip()
+                if '.' in path or '/' in path or '\\' in path:
+                    files[path] = file_content
+    return files
+
+def _get_indent(line):
+    return len(line) - len(line.lstrip())
+
+def _adjust_indent(line, diff):
+    stripped = line.lstrip()
+    if not stripped:
+        return line
+    current_indent = len(line) - len(stripped)
+    new_indent = max(0, current_indent + diff)
+    return ' ' * new_indent + stripped
+
+def _fix_search_indentation(content: str, data: dict) -> str:
+    """Fix indentation mismatches in SEARCH blocks by comparing against source in messages."""
+    messages = data.get('messages', [])
+    files_dict = _extract_files_from_messages(messages)
+    if not files_dict:
+        return content
+
+    # Find SEARCH/REPLACE blocks
+    block_pattern = re.compile(r'(<<<<<<< SEARCH\n)(.*?)(\n=======\n)(.*?)(\n>>>>>>> REPLACE)', re.DOTALL)
+    
+    def replace_callback(match):
+        prefix = match.group(1)
+        search_block = match.group(2)
+        mid = match.group(3)
+        replace_block = match.group(4)
+        suffix = match.group(5)
+        
+        # Try to find which file is being modified
+        match_start = match.start()
+        preceding_text = content[:match_start]
+        
+        # Find all filenames in backticks
+        mentioned_files = re.findall(r'`([a-zA-Z0-9_\-\.\/\\ ]+)`', preceding_text)
+        target_file = None
+        if mentioned_files:
+            for f in reversed(mentioned_files):
+                f_clean = f.strip()
+                if f_clean in files_dict:
+                    target_file = f_clean
+                    break
+        
+        # Fallback to single file default
+        if not target_file and len(files_dict) == 1:
+            target_file = list(files_dict.keys())[0]
+            
+        if not target_file or target_file not in files_dict:
+            return match.group(0)
+            
+        file_content = files_dict[target_file]
+        file_lines = file_content.splitlines()
+        search_lines = search_block.splitlines()
+        
+        if not search_lines:
+            return match.group(0)
+            
+        stripped_search = [line.strip() for line in search_lines if line.strip()]
+        if not stripped_search:
+            return match.group(0)
+            
+        best_ratio = 0.0
+        best_start_idx = -1
+        best_match_len = len(search_lines)
+        
+        # Sliding window search over target file (allow +-3 lines difference in length)
+        n_search = len(search_lines)
+        for w_len in range(max(1, n_search - 3), n_search + 4):
+            for i in range(len(file_lines) - w_len + 1):
+                window_lines = file_lines[i:i+w_len]
+                stripped_window = [line.strip() for line in window_lines if line.strip()]
+                
+                ratio = difflib.SequenceMatcher(None, stripped_search, stripped_window).ratio()
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_start_idx = i
+                    best_match_len = w_len
+                    
+        # Apply alignment only if similarity is high (>= 85%)
+        if best_ratio >= 0.85 and best_start_idx != -1:
+            aligned_search_lines = file_lines[best_start_idx : best_start_idx + best_match_len]
+            aligned_search_block = '\n'.join(aligned_search_lines)
+            
+            # Calculate indentation difference
+            model_first_non_empty = next((line for line in search_lines if line.strip()), '')
+            actual_first_non_empty = next((line for line in aligned_search_lines if line.strip()), '')
+            
+            model_indent = _get_indent(model_first_non_empty)
+            actual_indent = _get_indent(actual_first_non_empty)
+            indent_diff = actual_indent - model_indent
+            
+            # Adjust REPLACE block indentation
+            replace_lines = replace_block.splitlines()
+            aligned_replace_lines = [_adjust_indent(line, indent_diff) for line in replace_lines]
+            aligned_replace_block = '\n'.join(aligned_replace_lines)
+            
+            logger.info(f"[ALIGN SUCCESS] File: {target_file}, Ratio: {best_ratio:.2f}, Indent Shift: {indent_diff}")
+            return f"{prefix}{aligned_search_block}{mid}{aligned_replace_block}{suffix}"
+            
+        logger.info(f"[ALIGN SKIP] File: {target_file}, Best Ratio: {best_ratio:.2f} (under threshold)")
+        return match.group(0)
+
+    result = block_pattern.sub(replace_callback, content)
+    return result
+
+
+if __name__ == '__main__':
+    logger.info(f"Starting Aider Proxy on port {PORT}...")
+    logger.info(f"Forwarding to llama-server at: {LLAMA_SERVER_URL}")
+    app.run(port=PORT, host='127.0.0.1')
