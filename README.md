@@ -72,8 +72,8 @@ journalctl -u stateforge-monitor -f
 For `kilo_proxy`, the raw request payloads are also dumped as JSON files to `/var/log/kilo_proxy` (as defined in the systemd service) for debugging cache invalidation issues.
 
 ### Related Article
-The full architectural breakdown, development story, and detailed mechanisms of these proxies are documented in our tech blog article (Japanese):  
-[定年退職して暇なのでローカルLLMエージェント用の専用プロキシを構築してみた - Zenn](https://zenn.dev/akky/articles/4f17711462057d)
+The full architectural breakdown, development story, and detailed mechanisms of these proxies are documented in our tech blog article:  
+[Building a Dedicated Proxy for Local LLM Agents - Zenn](https://zenn.dev/akkyey/articles/abf10f9eb05f6a?locale=en)
 
 ---
 
@@ -144,4 +144,4 @@ journalctl -u stateforge-monitor -f
 
 ### 関連記事
 これらのプロキシのアーキテクチャや開発の裏話については、技術ブログにて詳細に解説しています：  
-[定年退職して暇なのでローカルLLMエージェント用の専用プロキシを構築してみた - Zenn](https://zenn.dev/akky/articles/4f17711462057d)
+[定年退職して暇なのでローカルLLMエージェント用の専用プロキシを構築してみた - Zenn](https://zenn.dev/akkyey/articles/abf10f9eb05f6a)
