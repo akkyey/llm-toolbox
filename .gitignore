@@ -10,3 +10,5 @@ proxy/aider_logs/
 __pycache__/
 *.pyc
 
+# TODO list
+TODO.md
