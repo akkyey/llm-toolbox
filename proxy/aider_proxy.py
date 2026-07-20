@@ -12,10 +12,16 @@ from typing import Dict, Any, Optional
 
 # 共通モジュールのインポート
 import proxy_common
+from proxy_etags import EtagsResolver
 from proxy_metrics import ProxyMetricsCollector
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
 logger = logging.getLogger("aider_proxy")
+# トークン制限等の環境変数
+OVERRIDE_MAX_TOKENS = int(os.environ.get("AIDER_PROXY_OVERRIDE_MAX_TOKENS", 16384))
+ARCHITECT_HARD_LIMIT = int(os.environ.get("AIDER_PROXY_ARCHITECT_HARD_LIMIT", 16384))
+EDITOR_HARD_LIMIT = int(os.environ.get("AIDER_PROXY_EDITOR_HARD_LIMIT", 4096))
+
 
 app = Flask(__name__)
 LLAMA_SERVER_URL = os.environ.get("LLAMA_SERVER_URL", "http://127.0.0.1:9090")
@@ -23,7 +29,9 @@ PORT = int(os.environ.get("AIDER_PROXY_PORT", 9092))
 LOG_DIR = os.environ.get("AIDER_PROXY_LOG_DIR", os.path.join(os.getcwd(), "aider_logs"))
 HEARTBEAT_INTERVAL_SEC = int(os.environ.get("HEARTBEAT_INTERVAL_SEC", 60))
 
+etags_resolver = EtagsResolver(tags_file=os.path.join(os.getcwd(), "tags"))
 aider_metrics = ProxyMetricsCollector("aider_proxy", PORT)
+
 
 @app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
 def proxy(path):
@@ -33,6 +41,9 @@ def proxy(path):
     if request.method == 'POST' and clean_path.endswith('chat/completions'):
         data = request.get_json(silent=True) or {}
         is_stream = data.get('stream', False)
+        original_max_tokens = data.get('max_tokens')
+        data['max_tokens'] = OVERRIDE_MAX_TOKENS
+        logger.info(f'[MAX_TOKENS] Overrode request max_tokens from {original_max_tokens} to {OVERRIDE_MAX_TOKENS}')
 
         model_name = data.get('model', '').lower()
         logger.info(f"[DEBUG] Received model_name='{model_name}'")
@@ -52,7 +63,28 @@ def proxy(path):
 
         # コンテキストの圧縮を実行
         if 'messages' in data:
-            data['messages'] = proxy_common.compress_messages(data['messages'])
+            messages = data['messages']
+            
+            # Etags JIT 解決とユーザー発言末尾への安全注入パイプライン
+            usr_msg = next((m for m in reversed(messages) if m.get('role') == 'user'), None)
+            if usr_msg and etags_resolver.tags_cache:
+                user_content = usr_msg.get('content', '')
+                if isinstance(user_content, str) and user_content:
+                    matched_symbols = etags_resolver.find_symbols_in_text(user_content)
+                    if matched_symbols:
+                        etags_context = (
+                            "\n\n<workspace_symbols_hint>\n"
+                            "The proxy pre-resolved the definitions of the symbols mentioned in your instructions. "
+                            "Use these to quickly locate files or understand variables/functions:\n"
+                        )
+                        for sym in matched_symbols:
+                            etags_context += f"- Symbol `{sym['symbol']}` is defined in `{sym['file']}`: `{sym['signature']}`\n"
+                        etags_context += "</workspace_symbols_hint>"
+                        usr_msg['content'] += etags_context
+                        logger.info(f"[ETAGS INJECT] JIT injected {len(matched_symbols)} symbols into user prompt.")
+
+            data['messages'] = proxy_common.compress_messages(messages)
+
 
         prompt_len = len(str(data.get('messages', '')))
         logger.info(f"[REQUEST] path={clean_path} stream={is_stream} prompt_len={prompt_len}")
@@ -84,6 +116,12 @@ def proxy(path):
                     logger.warning(f"[FAIL FAST] Editor context missing file content for: {target_file}. Returning 400 Bad Request.")
                     dummy_text = "Fail Fast: Retry skipped (Editor context missing target file content)."
                     proxy_common.save_aider_log(data, "", dummy_text, log_dir=LOG_DIR)
+                    # [設計注記] なぜ 400 Bad Request を返すのか？
+                    # 200 OK のダミー応答を返してしまうと、Aider (LiteLLM) はAPI通信が正常終了したと誤認します。
+                    # 結果、Architectのダミー出力(エラー理由)を「正常な設計書」として受け取り、
+                    # 次のEditor（実装）フェーズを誤って起動してしまう不整合（バグ）が発生します。
+                    # Aiderに例外（BadRequestError）をスローさせてその時点でタスク全体を即座にスキップさせるため、
+                    # ここでは明示的に 400 エラーを返却して Aider の実行ループを安全に中断させます。
                     err_json = {
                         "error": {
                             "message": dummy_text,
@@ -92,14 +130,16 @@ def proxy(path):
                         }
                     }
                     return Response(json.dumps(err_json), status=400, mimetype='application/json')
+
         if messages:
+            is_new_swe_task = any("Below is a real GitHub issue" in str(m.get('content', '')) for m in messages)
             has_assistant = any(m.get('role') == 'assistant' for m in messages)
-            if not has_assistant:
+            if not has_assistant or is_new_swe_task:
                 try:
                     # Slot 0 is default for single-slot servers (-np 1)
                     r1 = requests.post("http://127.0.0.1:9090/slots/0?action=erase", timeout=3)
                     r2 = requests.post("http://127.0.0.1:9093/slots/0?action=erase", timeout=3)
-                    logger.info(f"[CACHE CLEAR] Erased slots on 9090 (status: {r1.status_code}) and 9093 (status: {r2.status_code}) to prevent state pollution.")
+                    logger.info(f"[CACHE CLEAR] Erased slots on 9090 (status: {r1.status_code}) and 9093 (status: {r2.status_code}) to prevent state pollution (is_new_swe_task={is_new_swe_task}).")
                 except Exception as ce:
                     logger.error(f"[CACHE CLEAR ERROR] Failed to clear slots: {ce}")
 
@@ -125,6 +165,10 @@ def proxy(path):
                     logger.warning(f"[FAIL FAST] Aider retry requested (error count: {error_count}). Returning 400 Bad Request.")
                     dummy_text = "Fail Fast: Retry skipped."
                     proxy_common.save_aider_log(data, "", dummy_text, log_dir=LOG_DIR)
+                    # [設計注記] なぜ 400 Bad Request を返すのか？
+                    # 200 OK のダミー応答を返してしまうと、Aider (LiteLLM) はAPI通信が正常終了したと誤認します。
+                    # 結果、リトライ制限による終了であるにもかかわらず、次のEditorフェーズが起動してしまうバグが発生します。
+                    # ここで明示的に 400 エラーを返却して Aider の実行ループを例外（BadRequestError）で安全に即時中断させます。
                     err_json = {
                         "error": {
                             "message": dummy_text,
@@ -137,6 +181,10 @@ def proxy(path):
         max_context_chars = int(os.environ.get("AIDER_MAX_CONTEXT_CHARS", 120000))
         if prompt_len > max_context_chars:
             logger.warning(f"[REJECTED] Prompt length exceeds safety limit. Returning 400 Bad Request.")
+            # [設計注記] なぜ 400 Bad Request を返すのか？
+            # 200 OK のダミー応答を返してしまうと、Aiderはコンテキスト限界であるにもかかわらず
+            # 処理を続行しようとしてEditorフェーズなどを起動し、モデルがクラッシュや暴走を起こします。
+            # ここで明示的に 400 エラーを返却し、タスクを決定論的に即時スキップ（次の問題へ移行）させます。
             err_json = {
                 "error": {
                     "message": "This task was automatically skipped by StateForge Proxy because the context window limit was exceeded.",
@@ -145,6 +193,7 @@ def proxy(path):
                 }
             }
             return Response(json.dumps(err_json), status=400, mimetype='application/json')
+
 
         def fetch_stream_with_hallucination_detection():
             data['stream'] = True
@@ -227,7 +276,7 @@ def proxy(path):
                                             break
                                     
                                     # --- [A] Token budget guard ---
-                                    if is_editor and token_count > 1500:
+                                    if is_editor and token_count > EDITOR_HARD_LIMIT:
                                         if '<<<<<<< SEARCH' not in content_buffer:
                                             hallucination_detected = True
                                             hallucination_reason = f"editor_token_budget: {token_count} tokens without SEARCH marker"
@@ -236,10 +285,10 @@ def proxy(path):
                                             break
                                     
                                     # --- [A2] Architect token budget guard ---
-                                    if not is_editor and token_count > 15000:
+                                    if not is_editor and token_count > ARCHITECT_HARD_LIMIT:
                                         hallucination_detected = True
                                         hallucination_reason = f"architect_token_budget: {token_count} tokens exceeded hard cap"
-                                        logger.warning(f"[HALLUCINATION] Architect exceeded token budget ({token_count} tokens). Hard cap at 15000.")
+                                        logger.warning(f"[HALLUCINATION] Architect exceeded token budget ({token_count} tokens). Hard cap at " + str(ARCHITECT_HARD_LIMIT) + ".")
                                         resp.close()
                                         break
                                     

@@ -514,10 +514,18 @@ class MonitorTUI:
         elif pp_tok > 0:
             prog_segments.append((f"{L('prompt')}:{pp_tok}t ({fmt_val(prompt.get('tokens_per_second', 0), 't/s', 1)})", 8))
 
+        predict_tok = decode.get("tokens_predict", 0)
+        
         if status == "GENERATING" and gen_tok > 0:
-            prog_segments.append((f"{L('gen')}:{gen_tok}t {fmt_val(decode.get('tokens_per_second', 0), 't/s', 1)}", 6 | curses.A_BOLD))
+            if predict_tok > 0:
+                prog_segments.append((f"{L('gen')}:{gen_tok}/{predict_tok}t {fmt_val(decode.get('tokens_per_second', 0), 't/s', 1)}", 6 | curses.A_BOLD))
+            else:
+                prog_segments.append((f"{L('gen')}:{gen_tok}t {fmt_val(decode.get('tokens_per_second', 0), 't/s', 1)}", 6 | curses.A_BOLD))
         elif gen_tok > 0:
-            prog_segments.append((f"{L('gen')}:{gen_tok}t ({fmt_val(decode.get('tokens_per_second', 0), 't/s', 1)})", 8))
+            if predict_tok > 0:
+                prog_segments.append((f"{L('gen')}:{gen_tok}/{predict_tok}t ({fmt_val(decode.get('tokens_per_second', 0), 't/s', 1)})", 8))
+            else:
+                prog_segments.append((f"{L('gen')}:{gen_tok}t ({fmt_val(decode.get('tokens_per_second', 0), 't/s', 1)})", 8))
             
         if prog_segments:
             row = self._draw_segments(stdscr, row, w, prog_segments)

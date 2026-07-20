@@ -42,7 +42,7 @@ JST = timezone(timedelta(hours=9))
 # エンジン定義（ポート → サービス名・表示名）
 ENGINE_DEFS = {
     "9090": {"service": "llama-server",       "name_ja": "Local LLM (Port 9090)", "name_en": "Local LLM (Port 9090)"},
-    "9091": {"service": "llama-server-coder", "name_ja": "Local LLM (Port 9091)", "name_en": "Local LLM (Port 9091)"},
+    # "9091" removed
     "9093": {"service": "llama-server-architect", "name_ja": "Local LLM (Architect 9093)", "name_en": "Local LLM (Architect 9093)"},
 }
 
@@ -132,6 +132,7 @@ class DecodeMetrics:
     """トークン生成（デコード）の進捗情報"""
     tokens_generated: int = 0
     tokens_per_second: float = 0.0
+    tokens_predict: int = 0
 
 
 @dataclass
@@ -843,13 +844,11 @@ class MonitorDaemon:
         self._engines: dict[str, EngineState] = {}
         self._system_metrics = SystemMetrics()
         
-        self.ports = ports or ["9090", "9091"]
+        self.ports = ports or ["9090", "9093"]
         self._engine_defs = {}
         for port in self.ports:
             if port == "9090":
                 self._engine_defs[port] = {"service": "llama-server", "name_ja": "Local LLM (Port 9090)", "name_en": "Local LLM (Port 9090)"}
-            elif port == "9091":
-                self._engine_defs[port] = {"service": "llama-server-coder", "name_ja": "Local LLM (Port 9091)", "name_en": "Local LLM (Port 9091)"}
             elif port == "9093":
                 self._engine_defs[port] = {"service": "llama-server-architect", "name_ja": "Local LLM (Port 9093)", "name_en": "Local LLM (Port 9093)"}
             else:
@@ -927,6 +926,37 @@ class MonitorDaemon:
                         self._engines[port].process.pid = pid
                     refresh_counter = 0
 
+                # llama-server の /slots からリアルタイム進捗を取得
+                try:
+                    import requests
+                    for port in self.ports:
+                        url = f"http://127.0.0.1:{port}/slots"
+                        resp = await asyncio.to_thread(requests.get, url, timeout=1.0)
+                        if resp.status_code == 200:
+                            slots_data = resp.json()
+                            if slots_data and isinstance(slots_data, list):
+                                active_slot = next((s for s in slots_data if s.get("is_processing")), None)
+                                if active_slot:
+                                    next_toks = active_slot.get("next_token", [])
+                                    n_decoded = 0
+                                    if next_toks and isinstance(next_toks, list):
+                                        n_decoded = next_toks[0].get("n_decoded", 0)
+                                    n_prompt = active_slot.get("n_prompt_tokens", 0)
+                                    params = active_slot.get("params", {})
+                                    n_predict = params.get("n_predict", 0)
+                                    if n_predict <= 0 and next_toks:
+                                        n_remain = next_toks[0].get("n_remain", 0)
+                                        n_predict = n_decoded + n_remain
+                                    self._engines[port].status = "GENERATING"
+                                    self._engines[port].status_label = self._i18n.t("status_generating")
+                                    self._engines[port].decode.tokens_generated = n_decoded
+                                    self._engines[port].decode.tokens_predict = n_predict
+                                    if n_prompt > 0:
+                                        self._engines[port].prompt.tokens_processed = n_prompt
+                                        self._engines[port].total_tokens = n_prompt + n_decoded
+                except Exception:
+                    pass
+
                 # メトリクス収集
                 self._system_metrics, process_infos = await self._collector.collect()
 
@@ -963,8 +993,8 @@ def main():
         help="表示言語 / Display language (default: ja)"
     )
     parser.add_argument(
-        "--ports", type=str, default="9090,9091,9093",
-        help="監視対象ポート (カンマ区切り) / Ports to monitor (comma separated) (default: 9090,9091,9093)"
+        "--ports", type=str, default="9090,9093",
+        help="監視対象ポート (カンマ区切り) / Ports to monitor (comma separated) (default: 9090,9093)"
     )
     args = parser.parse_args()
 
